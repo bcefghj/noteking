@@ -39,13 +39,34 @@ class VideoMeta:
         return len(self.entries) if self.entries else 1
 
 
+BILIBILI_COOKIES_FILE = Path("/app/bilibili_cookies.txt")
+
+
 def _base_cmd(config: AppConfig) -> list[str]:
+    import os
+    from urllib.parse import unquote
+
     cmd = ["yt-dlp", "--no-warnings"]
-    proxy = config.proxy.for_ytdlp
+
+    # 代理：配置优先，其次读环境变量
+    proxy = config.proxy.for_ytdlp or os.environ.get("NOTEKING_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy:
         cmd += ["--proxy", proxy]
-    if config.bilibili_sessdata:
-        cmd += ["--cookies-from-browser", "chrome"]
+
+    # B站 cookies：文件优先，其次用 SESSDATA 生成临时文件
+    if BILIBILI_COOKIES_FILE.exists():
+        cmd += ["--cookies", str(BILIBILI_COOKIES_FILE)]
+    else:
+        sessdata = config.bilibili_sessdata or os.environ.get("BILIBILI_SESSDATA", "")
+        if sessdata:
+            decoded = unquote(sessdata)
+            tmp = Path(tempfile.mktemp(suffix="_bili_cookies.txt"))
+            tmp.write_text(
+                f"# Netscape HTTP Cookie File\n"
+                f".bilibili.com\tTRUE\t/\tTRUE\t9999999999\tSESSDATA\t{decoded}\n"
+            )
+            cmd += ["--cookies", str(tmp)]
+
     return cmd
 
 

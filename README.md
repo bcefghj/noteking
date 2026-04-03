@@ -6,6 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![小红书](https://img.shields.io/badge/小红书-bcefghj-red)](https://www.xiaohongshu.com/user/profile/bcefghj)
 
+### 在线体验
+
+**[http://150.158.123.30:3000](http://150.158.123.30:3000)** - 无需安装，直接使用（每日免费 20 次）
+
 ---
 
 ## 这是什么？
@@ -376,6 +380,12 @@ A: 需要安装 TinyTeX（很小，5分钟搞定）：
 curl -sL "https://yihui.org/tinytex/install-bin-unix.sh" | sh
 tlmgr install ctex tcolorbox listings booktabs float fancyhdr xcolor enumitem etoolbox
 ```
+
+---
+
+## 参考与致谢
+
+NoteKing 的开发参考了大量优秀的开源项目和同类产品，详见 [REFERENCES.md](REFERENCES.md)。
 
 ---
 

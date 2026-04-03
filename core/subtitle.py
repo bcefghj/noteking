@@ -150,13 +150,23 @@ def _try_youtube_transcript_api(
 
 
 def _try_ytdlp_subtitles(
-    parsed: ParsedLink, work_dir: Path, config: AppConfig
+    parsed: ParsedLink, work_dir: Path, config: AppConfig, timeout: int = 30
 ) -> SubtitleResult | None:
-    """Try yt-dlp subtitle download."""
+    """Try yt-dlp subtitle download with timeout."""
     from .downloader import download_subtitles
+    import signal
+
+    def _handler(signum, frame):
+        raise TimeoutError("subtitle download timeout")
 
     try:
-        srt_files = download_subtitles(parsed.url, work_dir, config)
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(timeout)
+        try:
+            srt_files = download_subtitles(parsed.url, work_dir, config)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
         if srt_files:
             segments = parse_srt(srt_files[0])
             if segments:
@@ -186,32 +196,36 @@ def extract_subtitles(
     parsed: ParsedLink,
     work_dir: Path,
     config: AppConfig,
+    skip_asr: bool = True,
 ) -> SubtitleResult:
     """Three-level subtitle extraction fallback.
 
     Priority 1: Platform CC subtitles (API or yt-dlp)
-    Priority 2: ASR speech-to-text
-    Priority 3: Empty result (visual mode deferred to LLM with frames)
+    Priority 2: ASR speech-to-text (only if skip_asr=False)
+    Priority 3: Empty result (visual mode deferred to LLM with metadata)
     """
     if parsed.platform == Platform.LOCAL:
-        result = _try_asr(parsed, work_dir, config)
-        if result:
-            return result
+        if not skip_asr:
+            result = _try_asr(parsed, work_dir, config)
+            if result:
+                return result
         return SubtitleResult(segments=[], source="visual")
 
-    # Level 1: CC subtitles
+    # Level 1: CC subtitles via YouTube Transcript API
     result = _try_youtube_transcript_api(parsed, config)
     if result:
         return result
 
+    # Level 1b: CC subtitles via yt-dlp
     result = _try_ytdlp_subtitles(parsed, work_dir, config)
     if result:
         return result
 
-    # Level 2: ASR
-    result = _try_asr(parsed, work_dir, config)
-    if result:
-        return result
+    # Level 2: ASR（默认跳过，避免长视频下载超时）
+    if not skip_asr:
+        result = _try_asr(parsed, work_dir, config)
+        if result:
+            return result
 
-    # Level 3: Visual mode (no transcript available)
+    # Level 3: Visual mode
     return SubtitleResult(segments=[], source="visual")

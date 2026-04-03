@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 
 const TEMPLATES = [
@@ -19,6 +19,14 @@ const TEMPLATES = [
   { name: "custom", label: "自定义", icon: "✏️" },
 ];
 
+const API_BASE =
+  typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : "http://api:8000";
+
+const HISTORY_KEY = "noteking_history";
+const MAX_HISTORY = 50;
+
 type Result = {
   title: string;
   content: string;
@@ -28,6 +36,50 @@ type Result = {
   duration: number;
 };
 
+type HistoryItem = {
+  id: string;
+  url: string;
+  title: string;
+  template: string;
+  contentPreview: string;
+  content: string;
+  source: string;
+  platform: string;
+  duration: number;
+  timestamp: number;
+};
+
+function loadHistory(): HistoryItem[] {
+  if (typeof window === "undefined") return [];
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(items: HistoryItem[]) {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, MAX_HISTORY)));
+}
+
+function addToHistory(result: Result, url: string) {
+  const items = loadHistory();
+  const item: HistoryItem = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    url,
+    title: result.title,
+    template: result.template,
+    contentPreview: result.content.slice(0, 120).replace(/\n/g, " "),
+    content: result.content,
+    source: result.source,
+    platform: result.platform,
+    duration: result.duration,
+    timestamp: Date.now(),
+  };
+  items.unshift(item);
+  saveHistory(items);
+}
+
 export default function Home() {
   const [url, setUrl] = useState("");
   const [template, setTemplate] = useState("detailed");
@@ -36,15 +88,32 @@ export default function Home() {
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState("");
   const [darkMode, setDarkMode] = useState(false);
+  const [streamContent, setStreamContent] = useState("");
+  const [streamStage, setStreamStage] = useState("");
+  const [streamTitle, setStreamTitle] = useState("");
+  const [remaining, setRemaining] = useState<number | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [copied, setCopied] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const handleSubmit = async () => {
-    if (!url.trim()) return;
+  useEffect(() => {
+    setHistory(loadHistory());
+  }, []);
+
+  const handleSubmit = useCallback(async () => {
+    if (!url.trim() || loading) return;
     setLoading(true);
     setError("");
     setResult(null);
+    setStreamContent("");
+    setStreamStage("正在连接...");
+    setStreamTitle("");
+
+    abortRef.current = new AbortController();
 
     try {
-      const resp = await fetch("/api/v1/summarize", {
+      const resp = await fetch(`${API_BASE}/api/v1/summarize/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -52,36 +121,142 @@ export default function Home() {
           template,
           custom_prompt: customPrompt,
         }),
+        signal: abortRef.current.signal,
       });
+
+      if (resp.status === 429) {
+        const errData = await resp.json().catch(() => ({}));
+        setRemaining(0);
+        throw new Error(errData.detail || "今日免费次数已用完（20次/天），明天再来吧~");
+      }
 
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `HTTP ${resp.status}`);
       }
 
-      const data = await resp.json();
-      setResult(data);
+      const limitHeader = resp.headers.get("X-RateLimit-Remaining");
+      if (limitHeader !== null) setRemaining(parseInt(limitHeader, 10));
+
+      const reader = resp.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+            switch (event.stage) {
+              case "info":
+                setStreamStage(event.message || "获取视频信息...");
+                if (event.title) setStreamTitle(event.title);
+                break;
+              case "subtitle":
+                setStreamStage(event.message || "提取字幕...");
+                break;
+              case "generating":
+                setStreamStage("AI 正在生成笔记...");
+                if (event.content) {
+                  accumulated += event.content;
+                  setStreamContent(accumulated);
+                }
+                break;
+              case "done": {
+                const finalResult: Result = {
+                  title: event.title || streamTitle,
+                  content: event.content || accumulated,
+                  template: event.template || template,
+                  source: event.source || "",
+                  platform: event.platform || "",
+                  duration: event.duration || 0,
+                };
+                setResult(finalResult);
+                addToHistory(finalResult, url.trim());
+                setHistory(loadHistory());
+                break;
+              }
+              case "error":
+                throw new Error(event.message || "生成失败");
+            }
+          } catch (parseErr: any) {
+            if (parseErr.message && !parseErr.message.includes("JSON"))
+              throw parseErr;
+          }
+        }
+      }
     } catch (e: any) {
-      setError(e.message || "Processing failed");
+      if (e.name !== "AbortError") {
+        setError(e.message || "生成失败，请重试");
+      }
     } finally {
       setLoading(false);
+      setStreamStage("");
+      abortRef.current = null;
     }
+  }, [url, template, customPrompt, loading, streamTitle]);
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    setLoading(false);
+    setStreamStage("");
   };
 
   const handleCopy = () => {
-    if (result?.content) {
-      navigator.clipboard.writeText(result.content);
+    const text = result?.content || streamContent;
+    if (text) {
+      navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     }
   };
 
   const handleDownload = () => {
-    if (!result?.content) return;
-    const blob = new Blob([result.content], { type: "text/markdown" });
+    const content = result?.content;
+    if (!content) return;
+    const isLatex = template === "latex_pdf";
+    const ext = isLatex ? ".tex" : ".md";
+    const mime = isLatex ? "application/x-tex" : "text/markdown";
+    const blob = new Blob([content], { type: mime });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `${result.title || "notes"}_${template}.md`;
+    a.download = `${result.title || "notes"}_${template}${ext}`;
     a.click();
   };
+
+  const handleHistoryClick = (item: HistoryItem) => {
+    setResult({
+      title: item.title,
+      content: item.content,
+      template: item.template,
+      source: item.source,
+      platform: item.platform,
+      duration: item.duration,
+    });
+    setTemplate(item.template);
+    setUrl(item.url);
+    setShowHistory(false);
+  };
+
+  const clearHistory = () => {
+    localStorage.removeItem(HISTORY_KEY);
+    setHistory([]);
+  };
+
+  const displayContent = result?.content || streamContent;
 
   return (
     <div className={darkMode ? "dark" : ""}>
@@ -92,43 +267,64 @@ export default function Home() {
             <div className="flex items-center gap-3">
               <span className="text-3xl">👑</span>
               <div>
-                <h1 className="text-xl font-bold">NoteKing</h1>
+                <h1 className="text-xl font-bold">NoteKing 笔记之王</h1>
                 <p className="text-xs text-[var(--text-secondary)]">
-                  Video &amp; Blog to Learning Notes
+                  视频一键生成学习笔记 | 支持 B站、YouTube 等 30+ 平台
                 </p>
               </div>
             </div>
-            <button
-              onClick={() => setDarkMode(!darkMode)}
-              className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-secondary)] transition text-sm"
-            >
-              {darkMode ? "☀️ Light" : "🌙 Dark"}
-            </button>
+            <div className="flex items-center gap-2">
+              {remaining !== null && (
+                <span className="text-xs text-[var(--text-secondary)] px-2 py-1 rounded border border-[var(--border)]">
+                  今日剩余 {remaining} 次
+                </span>
+              )}
+              <button
+                onClick={() => { setShowHistory(!showHistory); setResult(null); }}
+                className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-primary)] transition text-sm"
+              >
+                📋 历史
+              </button>
+              <button
+                onClick={() => setDarkMode(!darkMode)}
+                className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-primary)] transition text-sm"
+              >
+                {darkMode ? "☀️" : "🌙"}
+              </button>
+            </div>
           </div>
         </header>
 
         <main className="max-w-6xl mx-auto px-4 py-8">
-          {/* Input Section */}
+          {/* Input */}
           <div className="bg-[var(--bg-secondary)] rounded-2xl p-6 border border-[var(--border)] mb-8">
             <div className="flex gap-3 mb-4">
               <input
                 type="text"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="Paste video URL here... (Bilibili, YouTube, Douyin, etc.)"
+                placeholder="粘贴视频链接... (B站、YouTube、抖音、小红书等)"
                 className="flex-1 px-4 py-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)] text-base"
                 onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
               />
-              <button
-                onClick={handleSubmit}
-                disabled={loading || !url.trim()}
-                className="px-6 py-3 bg-[var(--accent)] text-white rounded-xl font-medium hover:opacity-90 transition disabled:opacity-50 whitespace-nowrap"
-              >
-                {loading ? "Processing..." : "Generate Notes"}
-              </button>
+              {loading ? (
+                <button
+                  onClick={handleCancel}
+                  className="px-6 py-3 bg-red-500 text-white rounded-xl font-medium hover:opacity-90 transition whitespace-nowrap"
+                >
+                  取消
+                </button>
+              ) : (
+                <button
+                  onClick={handleSubmit}
+                  disabled={!url.trim()}
+                  className="px-6 py-3 bg-[var(--accent)] text-white rounded-xl font-medium hover:opacity-90 transition disabled:opacity-50 whitespace-nowrap"
+                >
+                  生成笔记
+                </button>
+              )}
             </div>
 
-            {/* Template Selector */}
             <div className="flex flex-wrap gap-2">
               {TEMPLATES.map((t) => (
                 <button
@@ -149,7 +345,7 @@ export default function Home() {
               <textarea
                 value={customPrompt}
                 onChange={(e) => setCustomPrompt(e.target.value)}
-                placeholder="Enter your custom prompt..."
+                placeholder="输入自定义 Prompt..."
                 className="w-full mt-3 px-4 py-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)] min-h-[80px] text-sm"
               />
             )}
@@ -162,30 +358,37 @@ export default function Home() {
             </div>
           )}
 
-          {/* Loading */}
+          {/* Streaming progress */}
           {loading && (
-            <div className="flex flex-col items-center justify-center py-16">
-              <div className="w-12 h-12 border-4 border-[var(--accent)] border-t-transparent rounded-full animate-spin mb-4" />
-              <p className="text-[var(--text-secondary)]">
-                Extracting subtitles and generating notes...
-              </p>
-              <p className="text-xs text-[var(--text-secondary)] mt-1">
-                This may take 30-60 seconds depending on video length
-              </p>
+            <div className="bg-[var(--bg-secondary)] rounded-2xl border border-[var(--border)] mb-6">
+              <div className="px-6 py-4 border-b border-[var(--border)] flex items-center gap-3">
+                <div className="w-5 h-5 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
+                <span className="text-sm font-medium">{streamStage}</span>
+                {streamTitle && (
+                  <span className="text-xs text-[var(--text-secondary)] ml-auto truncate max-w-[300px]">
+                    {streamTitle}
+                  </span>
+                )}
+              </div>
+              {streamContent && (
+                <div className="p-6 note-content prose prose-slate dark:prose-invert max-w-none max-h-[60vh] overflow-y-auto">
+                  <ReactMarkdown>{streamContent}</ReactMarkdown>
+                </div>
+              )}
             </div>
           )}
 
           {/* Result */}
-          {result && (
+          {result && !loading && (
             <div className="bg-[var(--bg-secondary)] rounded-2xl border border-[var(--border)]">
               <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
                 <div>
                   <h2 className="font-semibold text-lg">{result.title}</h2>
                   <div className="flex gap-3 text-xs text-[var(--text-secondary)] mt-1">
-                    <span>Platform: {result.platform}</span>
-                    <span>Source: {result.source}</span>
+                    <span>平台: {result.platform}</span>
+                    <span>字幕: {result.source}</span>
                     {result.duration > 0 && (
-                      <span>Duration: {Math.round(result.duration / 60)} min</span>
+                      <span>时长: {Math.round(result.duration / 60)} 分钟</span>
                     )}
                   </div>
                 </div>
@@ -194,13 +397,13 @@ export default function Home() {
                     onClick={handleCopy}
                     className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-primary)] transition text-sm"
                   >
-                    Copy
+                    {copied ? "已复制!" : "复制"}
                   </button>
                   <button
                     onClick={handleDownload}
                     className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-primary)] transition text-sm"
                   >
-                    Download .md
+                    下载 {template === "latex_pdf" ? ".tex" : ".md"}
                   </button>
                 </div>
               </div>
@@ -210,53 +413,77 @@ export default function Home() {
             </div>
           )}
 
-          {/* Features Section */}
-          {!result && !loading && (
+          {/* History panel */}
+          {showHistory && !loading && !result && (
+            <div className="bg-[var(--bg-secondary)] rounded-2xl border border-[var(--border)]">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
+                <h2 className="font-semibold">历史记录 ({history.length})</h2>
+                {history.length > 0 && (
+                  <button onClick={clearHistory} className="text-xs text-red-500 hover:underline">
+                    清空
+                  </button>
+                )}
+              </div>
+              {history.length === 0 ? (
+                <div className="p-8 text-center text-[var(--text-secondary)]">暂无记录</div>
+              ) : (
+                <div className="divide-y divide-[var(--border)]">
+                  {history.map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => handleHistoryClick(item)}
+                      className="w-full text-left px-6 py-4 hover:bg-[var(--bg-primary)] transition"
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-medium text-sm truncate max-w-[70%]">{item.title}</span>
+                        <span className="text-xs text-[var(--text-secondary)]">
+                          {new Date(item.timestamp).toLocaleDateString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      </div>
+                      <div className="flex gap-2 text-xs text-[var(--text-secondary)]">
+                        <span>{TEMPLATES.find(t => t.name === item.template)?.icon} {TEMPLATES.find(t => t.name === item.template)?.label}</span>
+                        <span>| {item.platform}</span>
+                      </div>
+                      <p className="text-xs text-[var(--text-secondary)] mt-1 line-clamp-1">{item.contentPreview}</p>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Features */}
+          {!result && !loading && !showHistory && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-8">
-              <FeatureCard
-                icon="🌐"
-                title="30+ Platforms"
-                desc="Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, and 1800+ more"
-              />
-              <FeatureCard
-                icon="📋"
-                title="13 Templates"
-                desc="Notes, mind maps, flashcards, quizzes, exam prep, and more"
-              />
-              <FeatureCard
-                icon="🎯"
-                title="Smart Extraction"
-                desc="Three-level subtitle fallback: CC subs, ASR, visual mode"
-              />
-              <FeatureCard
-                icon="📦"
-                title="Batch Processing"
-                desc="Process entire playlists and courses with 50+ videos"
-              />
-              <FeatureCard
-                icon="🔌"
-                title="Multiple Interfaces"
-                desc="Web, CLI, MCP Server, OpenClaw Skill, Desktop, and API"
-              />
-              <FeatureCard
-                icon="🌏"
-                title="YouTube Proxy"
-                desc="Built-in proxy support for accessing YouTube from China"
-              />
+              <FC icon="🌐" title="30+ 平台" desc="B站、YouTube、抖音、小红书、TikTok 等 1800+ 平台" />
+              <FC icon="📋" title="13 种模板" desc="笔记、思维导图、闪卡、测验、考试复习等" />
+              <FC icon="🎯" title="智能字幕提取" desc="三级回退：CC字幕 -> ASR语音识别 -> 视觉模式" />
+              <FC icon="📄" title="LaTeX PDF 讲义" desc="自动生成带目录、代码块的 PDF 图文讲义" />
+              <FC icon="📦" title="批量处理" desc="支持整个播放列表和 50+ 集课程批量生成" />
+              <FC icon="⚡" title="流式输出" desc="实时看到 AI 生成过程，无需等待" />
             </div>
           )}
         </main>
 
         {/* Footer */}
         <footer className="border-t border-[var(--border)] mt-16">
-          <div className="max-w-6xl mx-auto px-4 py-6 text-center text-sm text-[var(--text-secondary)]">
-            NoteKing - Open Source Video to Learning Notes Tool |{" "}
-            <a
-              href="https://github.com/bcefghj/noteking"
-              className="text-[var(--accent)] hover:underline"
-            >
-              GitHub
-            </a>
+          <div className="max-w-6xl mx-auto px-4 py-6">
+            <div className="flex flex-col md:flex-row items-center justify-between gap-4">
+              <div className="text-sm text-[var(--text-secondary)]">
+                NoteKing 笔记之王 - 开源视频学习笔记工具 | 每日免费 20 次
+              </div>
+              <div className="flex items-center gap-4 text-sm">
+                <a href="https://github.com/bcefghj/noteking" target="_blank"
+                  className="text-[var(--accent)] hover:underline flex items-center gap-1">
+                  <svg className="w-4 h-4" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                  GitHub
+                </a>
+                <a href="https://www.xiaohongshu.com/user/profile/bcefghj" target="_blank"
+                  className="text-[var(--accent)] hover:underline flex items-center gap-1">
+                  📕 小红书: bcefghj
+                </a>
+              </div>
+            </div>
           </div>
         </footer>
       </div>
@@ -264,15 +491,7 @@ export default function Home() {
   );
 }
 
-function FeatureCard({
-  icon,
-  title,
-  desc,
-}: {
-  icon: string;
-  title: string;
-  desc: string;
-}) {
+function FC({ icon, title, desc }: { icon: string; title: string; desc: string }) {
   return (
     <div className="bg-[var(--bg-secondary)] rounded-xl p-5 border border-[var(--border)]">
       <span className="text-2xl">{icon}</span>
