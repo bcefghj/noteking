@@ -6,6 +6,29 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![小红书](https://img.shields.io/badge/小红书-bcefghj-red)](https://www.xiaohongshu.com/user/profile/bcefghj)
 
+---
+
+## 🚀 升级版来了 → NoteKing Pro
+
+> 本仓库是 **NoteKing v1（视频笔记）**，专注在线视频转 PDF 讲义。
+>
+> 如果你还需要处理**本地录音/会议**，请移步升级版：
+
+| | NoteKing（本仓库） | [NoteKing Pro](https://github.com/bcefghj/noteking-pro) |
+|--|--|--|
+| 在线视频转笔记 | ✅ | ✅ |
+| 本地录音/会议处理 | ❌ | ✅ |
+| 说话人分离（多人会议） | ❌ | ✅ |
+| 降噪增强 | ❌ | ✅ |
+| 多文件合并 | ❌ | ✅ |
+| 输出模板数量 | 13 种 | 23 种 |
+| MCP Server 工具 | 基础 | 扩展版 |
+| 案例演示 | MiniMind 课程 | OpenClaw 圆桌会议 |
+
+**👉 [点击进入 NoteKing Pro →](https://github.com/bcefghj/noteking-pro)**
+
+---
+
 ### 在线体验
 
 **[http://150.158.123.30:3000](http://150.158.123.30:3000)** - 无需安装，直接使用（每日免费 20 次）
@@ -396,3 +419,7 @@ MIT
 ---
 
 **GitHub**: [github.com/bcefghj/noteking](https://github.com/bcefghj/noteking) · **小红书**: bcefghj
+
+---
+
+> 🔺 **需要处理本地录音/会议？** 升级到 [NoteKing Pro](https://github.com/bcefghj/noteking-pro)，支持说话人分离、降噪、23 种模板。
