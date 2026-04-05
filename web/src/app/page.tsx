@@ -34,6 +34,7 @@ type Result = {
   source: string;
   platform: string;
   duration: number;
+  frames_b64?: Record<string, string>;
 };
 
 type HistoryItem = {
@@ -183,6 +184,7 @@ export default function Home() {
                   source: event.source || "",
                   platform: event.platform || "",
                   duration: event.duration || 0,
+                  frames_b64: event.frames_b64 || {},
                 };
                 setResult(finalResult);
                 addToHistory(finalResult, url.trim());
@@ -235,6 +237,84 @@ export default function Home() {
     a.href = URL.createObjectURL(blob);
     a.download = `${result.title || "notes"}_${template}${ext}`;
     a.click();
+  };
+
+  const [pdfCompiling, setPdfCompiling] = useState(false);
+
+  const handleDownloadPDF = async () => {
+    const content = result?.content;
+    if (!content) return;
+    const title = result?.title || "NoteKing 笔记";
+    const isLatex = result?.template === "latex_pdf" || template === "latex_pdf";
+
+    if (isLatex) {
+      setPdfCompiling(true);
+      try {
+        const resp = await fetch(`${API_BASE}/api/v1/compile-latex`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tex_content: content,
+            filename: title,
+            frames_b64: result?.frames_b64 || {},
+          }),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.detail || `PDF 编译失败 (${resp.status})`);
+        }
+        const blob = await resp.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `${title}.pdf`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e: any) {
+        alert(e.message || "PDF 编译失败");
+      } finally {
+        setPdfCompiling(false);
+      }
+      return;
+    }
+
+    const win = window.open("", "_blank");
+    if (!win) return;
+    win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>${title} - NoteKing</title>
+<style>
+  @media print { body { margin: 0; } @page { margin: 1.5cm 2cm; } }
+  body { font-family: -apple-system, "Microsoft YaHei", sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; color: #1a1a1a; line-height: 1.8; font-size: 14px; }
+  h1 { font-size: 22px; border-bottom: 2px solid #3b82f6; padding-bottom: 8px; }
+  h2 { font-size: 18px; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; margin-top: 24px; }
+  h3 { font-size: 16px; margin-top: 18px; }
+  code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  pre code { background: none; color: inherit; padding: 0; }
+  blockquote { border-left: 3px solid #3b82f6; padding: 8px 16px; margin: 12px 0; background: #f8fafc; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
+  th { background: #f8fafc; font-weight: 600; }
+  strong { color: #3b82f6; }
+  .header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #3b82f6; }
+  .header h1 { border: none; margin: 0; }
+  .header p { color: #64748b; margin: 4px 0; font-size: 12px; }
+  .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #e5e7eb; text-align: center; color: #94a3b8; font-size: 11px; }
+</style>
+</head><body>
+<div class="header">
+  <h1>${title}</h1>
+  <p>\u5e73\u53f0: ${result?.platform || ""} | \u5b57\u5e55: ${result?.source || ""} | \u65f6\u957f: ${result?.duration ? Math.round(result.duration / 60) + " \u5206\u949f" : ""}</p>
+  <p>\u7531 NoteKing \u7b14\u8bb0\u4e4b\u738b \u81ea\u52a8\u751f\u6210 | github.com/bcefghj/noteking</p>
+</div>
+<div id="content"></div>
+<div class="footer">NoteKing \u7b14\u8bb0\u4e4b\u738b | GitHub: github.com/bcefghj/noteking | \u5c0f\u7ea2\u4e66: bcefghj</div>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script>
+<script>
+  document.getElementById("content").innerHTML = marked.parse(${JSON.stringify(content)});
+  setTimeout(() => { window.print(); }, 500);
+<\/script>
+</body></html>`);
+    win.document.close();
   };
 
   const handleHistoryClick = (item: HistoryItem) => {
@@ -398,6 +478,13 @@ export default function Home() {
                     className="px-3 py-1.5 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-primary)] transition text-sm"
                   >
                     {copied ? "已复制!" : "复制"}
+                  </button>
+                  <button
+                    onClick={handleDownloadPDF}
+                    disabled={pdfCompiling}
+                    className="px-3 py-1.5 rounded-lg bg-[var(--accent)] text-white hover:opacity-90 transition text-sm disabled:opacity-60"
+                  >
+                    {pdfCompiling ? "编译中..." : "下载 PDF"}
                   </button>
                   <button
                     onClick={handleDownload}

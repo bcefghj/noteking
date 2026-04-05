@@ -9,8 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Generator
 
+import httpx
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
+from pydantic import BaseModel
 
 from api.models.schemas import (
     VideoRequest, VideoResponse, BatchRequest, BatchResponse,
@@ -128,11 +130,45 @@ async def summarize_video_stream(req: VideoRequest):
                              message=f"字幕来源: {subs.source}",
                              source=subs.source)
 
+            # ── 关键帧提取（仅 latex_pdf 模板）──────────────────────────────
+            frames_b64: dict[str, str] = {}   # {"frame_00.jpg": "<base64>", ...}
+            frames_info: list[dict] = []       # [{"name": "...", "ts": 12.5}, ...]
+            if req.template == "latex_pdf":
+                try:
+                    from core.downloader import download_video
+                    from core.frames import extract_keyframes
+                    import base64
+
+                    yield _sse_event("info", message="正在下载视频提取截图（约1-3分钟）...")
+                    frames_dir = work_dir / "frames"
+                    frames_dir.mkdir(exist_ok=True)
+
+                    video_path = download_video(req.url, work_dir / "video", cfg,
+                                                quality="bestvideo[height<=720]+bestaudio/best[height<=720]/best")
+                    yield _sse_event("info", message="正在提取关键帧...")
+                    kframes = extract_keyframes(video_path, frames_dir, max_frames=12)
+
+                    for i, f in enumerate(kframes):
+                        name = f"frame_{i:02d}.jpg"
+                        dst = frames_dir / name
+                        if not dst.exists() and f.path.exists():
+                            dst = f.path
+                        if dst.exists():
+                            frames_b64[name] = base64.b64encode(dst.read_bytes()).decode()
+                            frames_info.append({"name": name, "ts": f.timestamp,
+                                                "ts_str": f.timestamp_str})
+                    yield _sse_event("info",
+                                     message=f"已提取 {len(frames_info)} 张关键帧")
+                except Exception as fe:
+                    yield _sse_event("info", message=f"截图提取跳过: {fe}")
+            # ────────────────────────────────────────────────────────────────
+
             yield _sse_event("generating", message="AI 正在生成笔记...")
             tmpl = get_template(req.template, user_prompt=req.custom_prompt)
             ctx = TemplateContext(
                 meta=meta, subtitles=subs, config=cfg,
-                extra={"custom_prompt": req.custom_prompt},
+                extra={"custom_prompt": req.custom_prompt,
+                       "frames_info": frames_info},
             )
             prompt = tmpl.build_prompt(ctx)
             system = tmpl.system_prompt(ctx)
@@ -160,6 +196,7 @@ async def summarize_video_stream(req: VideoRequest):
                 "url": req.url,
                 "platform": parsed.platform.value,
                 "duration": meta.duration,
+                "frames_b64": frames_b64,   # 传给前端，下载 PDF 时回传给编译服务
             }
             cache.set(req.url, req.template, result)
 
@@ -235,3 +272,46 @@ async def get_transcript(url: str):
         return {"url": url, "transcript": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+LATEX_COMPILER_URL = os.environ.get("LATEX_COMPILER_URL", "http://host.docker.internal:9090")
+
+
+class LatexCompileRequest(BaseModel):
+    tex_content: str
+    filename: str = "noteking_notes"
+
+
+@router.post("/compile-latex")
+async def compile_latex(req: LatexCompileRequest):
+    """Proxy LaTeX compilation to the host-side compiler service."""
+    safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', req.filename)[:80]
+    try:
+        transport = httpx.AsyncHTTPTransport()
+        async with httpx.AsyncClient(timeout=180, transport=transport) as client:
+            resp = await client.post(
+                f"{LATEX_COMPILER_URL}/compile",
+                json={"tex_content": req.tex_content, "filename": req.filename},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LaTeX 编译服务未启动，请联系管理员")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LaTeX 编译超时（>180秒）")
+
+    if resp.status_code != 200:
+        detail = "LaTeX 编译失败"
+        try:
+            detail = resp.json().get("error", detail)
+        except Exception:
+            pass
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    from urllib.parse import quote
+    encoded_name = quote(f"{safe_name}.pdf")
+    return Response(
+        content=resp.content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+        },
+    )
