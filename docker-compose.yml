@@ -16,8 +16,8 @@ services:
 
   web:
     build:
-      context: ./web
-      dockerfile: ../Dockerfile.web
+      context: .
+      dockerfile: ./Dockerfile.web
     ports:
       - "3000:3000"
     environment:
